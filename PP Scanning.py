@@ -2,7 +2,6 @@ import streamlit as st
 from openai import OpenAI
 from PIL import Image, ImageOps, ImageFilter
 import io, base64
-import re
 import json
 
 # --- Convert PIL image to base64 for GPT ---
@@ -20,7 +19,7 @@ def crop_mrz(img: Image.Image) -> Image.Image:
     mrz_zone = mrz_zone.filter(ImageFilter.SHARPEN)
     return mrz_zone
 
-# --- Check digit validation (ISO 18013 MRZ algorithm) ---
+# --- Check digit validation ---
 def compute_check_digit(data: str) -> str:
     weights = [7, 3, 1]
     total = 0
@@ -37,12 +36,61 @@ def compute_check_digit(data: str) -> str:
 def validate_mrz_field(field: str, check_digit: str) -> bool:
     return compute_check_digit(field) == check_digit
 
+# --- Parse MRZ lines deterministically ---
+def parse_mrz_lines(line1: str, line2: str):
+    line1 = (line1 + "<"*44)[:44]
+    line2 = (line2 + "<"*44)[:44]
+
+    surname, given_names = "", ""
+    try:
+        # Line 1
+        doc_type = line1[0:2]
+        issuing_country = line1[2:5]
+        names_raw = line1[5:44]
+        parts = names_raw.split("<<")
+        surname = parts[0].replace("<", " ").strip()
+        given_names = " ".join([p.replace("<", " ").strip() for p in parts[1:] if p])
+
+        # Line 2
+        passport_number = line2[0:9].replace("<", "")
+        passport_number_check = line2[9]
+        nationality = line2[10:13]
+        dob_raw = line2[13:19]
+        dob_check = line2[19]
+        sex = line2[20]
+        expiry_raw = line2[21:27]
+        expiry_check = line2[27]
+
+        # Expand dates
+        dob = f"19{dob_raw[0:2]}-{dob_raw[2:4]}-{dob_raw[4:6]}"
+        expiry = f"20{expiry_raw[0:2]}-{expiry_raw[2:4]}-{expiry_raw[4:6]}"
+
+        return {
+            "doc_type": doc_type,
+            "issuing_country": issuing_country,
+            "surname": surname,
+            "given_names": given_names,
+            "passport_number": passport_number,
+            "passport_number_check": passport_number_check,
+            "passport_valid": validate_mrz_field(line2[0:9], passport_number_check),
+            "nationality": nationality,
+            "date_of_birth": dob,
+            "dob_valid": validate_mrz_field(dob_raw, dob_check),
+            "sex": sex,
+            "expiry_date": expiry,
+            "expiry_valid": validate_mrz_field(expiry_raw, expiry_check),
+            "mrz_line1": line1,
+            "mrz_line2": line2
+        }
+    except Exception:
+        return {"mrz_line1": line1, "mrz_line2": line2}
+
 # --- Streamlit App ---
 st.set_page_config(page_title="Passport Scanner", page_icon="🛂", layout="centered")
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.title("🛂 Passport Scanner (With Validation)")
-st.write("This version crops + enhances the MRZ, extracts fields with GPT, and validates check digits.")
+st.title("🛂 Passport Scanner (Two-Step MRZ Parsing)")
+st.write("Step 1: GPT extracts raw MRZ lines. Step 2: Parsing + validation done locally.")
 
 uploaded = st.file_uploader("Upload passport photo", type=["jpg", "jpeg", "png"])
 cam = st.camera_input("Or take a picture")
@@ -57,7 +105,7 @@ if image_file:
     mrz_img = crop_mrz(full_img)
     st.image(mrz_img, caption="Processed MRZ Zone")
 
-    with st.spinner("Analyzing MRZ with AI..."):
+    with st.spinner("Extracting raw MRZ lines with GPT..."):
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -65,52 +113,42 @@ if image_file:
                     {
                         "role": "system",
                         "content": (
-                            "You are a document parsing assistant. Extract the MRZ from passports "
-                            "and parse it into structured fields. "
-                            "Return JSON with keys: surname, given_names, passport_number, passport_number_check, "
-                            "nationality, date_of_birth (YYYY-MM-DD), sex, expiry_date (YYYY-MM-DD), expiry_check."
+                            "You are a document OCR assistant. Extract only the two MRZ lines "
+                            "(44 characters each, uppercase, < for filler, no spaces, no JSON, no explanations)."
                         )
                     },
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "Extract MRZ fields and include the MRZ check digits."},
+                            {"type": "text", "text": "Return only the two MRZ lines."},
                             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_to_base64(mrz_img)}}
                         ]
                     }
                 ],
-                max_tokens=500
+                max_tokens=200
             )
-            parsed_json = response.choices[0].message.content
+            mrz_text = response.choices[0].message.content.strip()
         except Exception as e:
-            parsed_json = f"Error: {e}"
+            mrz_text = f"Error: {e}"
 
-    st.subheader("Extracted Data (Raw JSON)")
-    st.code(parsed_json, language="json")
+    st.subheader("Raw MRZ Extracted")
+    st.code(mrz_text)
 
-    # --- Post-processing: validate check digits ---
-    try:
-        data = json.loads(parsed_json)
-    except Exception:
-        data = {}
+    # Split into lines and parse locally
+    lines = [l.strip() for l in mrz_text.splitlines() if l.strip()]
+    if len(lines) >= 2:
+        parsed = parse_mrz_lines(lines[0], lines[1])
 
-    if data:
-        st.subheader("Validated Fields")
-        # Passport number
-        pn = data.get("passport_number", "")
-        pn_check = data.get("passport_number_check", "")
-        pn_valid = validate_mrz_field(pn, pn_check) if pn and pn_check else False
+        st.subheader("Parsed Fields with Validation")
+        st.markdown(f"**Surname:** {parsed.get('surname','')}")
+        st.markdown(f"**Given Names:** {parsed.get('given_names','')}")
+        st.markdown(f"**Passport Number:** {parsed.get('passport_number','')} → {'✅ valid' if parsed.get('passport_valid') else '❌ invalid'}")
+        st.markdown(f"**Nationality:** {parsed.get('nationality','')}")
+        st.markdown(f"**Date of Birth:** {parsed.get('date_of_birth','')} → {'✅ valid' if parsed.get('dob_valid') else '❌ invalid'}")
+        st.markdown(f"**Sex:** {parsed.get('sex','')}")
+        st.markdown(f"**Expiry Date:** {parsed.get('expiry_date','')} → {'✅ valid' if parsed.get('expiry_valid') else '❌ invalid'}")
 
-        # Expiry
-        exp = re.sub(r"[^0-9]", "", data.get("expiry_date", ""))
-        exp_check = data.get("expiry_check", "")
-        exp_valid = validate_mrz_field(exp, exp_check) if exp and exp_check else False
-
-        # Show results
-        st.markdown(f"**Surname:** {data.get('surname','')}")
-        st.markdown(f"**Given Names:** {data.get('given_names','')}")
-        st.markdown(f"**Passport Number:** {pn} → {'✅ valid' if pn_valid else '❌ invalid'}")
-        st.markdown(f"**Nationality:** {data.get('nationality','')}")
-        st.markdown(f"**Date of Birth:** {data.get('date_of_birth','')}")
-        st.markdown(f"**Sex:** {data.get('sex','')}")
-        st.markdown(f"**Expiry Date:** {data.get('expiry_date','')} → {'✅ valid' if exp_valid else '❌ invalid'}")
+        st.text_area("MRZ Line 1", parsed.get("mrz_line1",""))
+        st.text_area("MRZ Line 2", parsed.get("mrz_line2",""))
+    else:
+        st.error("Could not extract two valid MRZ lines.")
