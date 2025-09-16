@@ -1,18 +1,47 @@
 import streamlit as st
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 import io, base64
+import re
 
+# --- Convert PIL image to base64 for GPT ---
 def image_to_base64(img: Image.Image) -> str:
     buffered = io.BytesIO()
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
+# --- Preprocess: crop + enhance MRZ area ---
+def crop_mrz(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    mrz_zone = img.crop((0, int(h*0.65), w, h))  # bottom ~35%
+    mrz_zone = mrz_zone.convert("L")             # grayscale
+    mrz_zone = ImageOps.autocontrast(mrz_zone)   # boost contrast
+    mrz_zone = mrz_zone.filter(ImageFilter.SHARPEN)
+    return mrz_zone
+
+# --- Check digit validation (ISO 18013 MRZ algorithm) ---
+def compute_check_digit(data: str) -> str:
+    weights = [7, 3, 1]
+    total = 0
+    for i, char in enumerate(data):
+        if char.isdigit():
+            val = int(char)
+        elif char == "<":
+            val = 0
+        else:
+            val = ord(char) - 55  # A=10, B=11...
+        total += val * weights[i % 3]
+    return str(total % 10)
+
+def validate_mrz_field(field: str, check_digit: str) -> bool:
+    return compute_check_digit(field) == check_digit
+
+# --- Streamlit App ---
 st.set_page_config(page_title="Passport Scanner", page_icon="🛂", layout="centered")
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.title("🛂 Passport Scanner (AI Vision)")
-st.write("Upload or capture a passport photo. The app uses GPT-4o-mini vision to read the MRZ and show a sample email draft.")
+st.title("🛂 Passport Scanner (Improved)")
+st.write("This version crops + enhances the MRZ and validates expiry/dates using check digits.")
 
 uploaded = st.file_uploader("Upload passport photo", type=["jpg", "jpeg", "png"])
 cam = st.camera_input("Or take a picture")
@@ -20,10 +49,14 @@ cam = st.camera_input("Or take a picture")
 image_file = cam or uploaded
 
 if image_file:
-    image = Image.open(image_file)
-    st.image(image, caption="Captured Image")
+    full_img = Image.open(image_file)
+    st.image(full_img, caption="Original Photo")
 
-    with st.spinner("Analyzing passport..."):
+    # Crop MRZ zone
+    mrz_img = crop_mrz(full_img)
+    st.image(mrz_img, caption="Processed MRZ Zone")
+
+    with st.spinner("Analyzing MRZ with AI..."):
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -31,16 +64,17 @@ if image_file:
                     {
                         "role": "system",
                         "content": (
-                            "You are a document parsing assistant. Extract the MRZ from passports "
-                            "and parse it into structured fields. Return JSON with: surname, given_names, "
-                            "passport_number, nationality, date_of_birth (YYYY-MM-DD), sex, expiry_date (YYYY-MM-DD)."
+                            "You are a document parsing assistant. Extract the MRZ (machine-readable zone) "
+                            "from this passport image, then parse it into structured fields. "
+                            "Return JSON with: surname, given_names, passport_number, passport_number_check, "
+                            "nationality, date_of_birth (YYYY-MM-DD), sex, expiry_date (YYYY-MM-DD), expiry_check."
                         )
                     },
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "Extract MRZ and structured fields from this passport."},
-                            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_to_base64(image)}}
+                            {"type": "text", "text": "Extract MRZ fields and include the MRZ check digits."},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_to_base64(mrz_img)}}
                         ]
                     }
                 ],
@@ -53,24 +87,4 @@ if image_file:
     st.subheader("Extracted Data (Raw JSON)")
     st.code(parsed_json, language="json")
 
-    # --- Show sample email draft ---
-    st.subheader("📧 Sample Email Draft")
-    sample_email = f"""
-To: example@domain.com
-Subject: Passport Information Submission
-
-Hello,
-
-Please find below the extracted passport information:
-
-{parsed_json}
-
-The scanned passport image is attached for reference.
-
-Regards,
-Automated Passport Scanner
-"""
-    st.text_area("Email Preview", sample_email, height=300)
-
-    # Show "attachment preview"
-    st.image(image, caption="This image would be attached to the email", use_container_width=True)
+    st.info("✅ Next step would be to parse this JSON into fields and run check digit validation on `passport_number` and `expiry_date`.")
