@@ -3,20 +3,17 @@ from openai import OpenAI
 from PIL import Image
 import io, base64
 
-# --- Helper to convert PIL image to base64 string ---
 def image_to_base64(img: Image.Image) -> str:
     buffered = io.BytesIO()
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# --- Streamlit App ---
 st.set_page_config(page_title="Passport Scanner", page_icon="🛂", layout="centered")
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.title("🛂 Passport Scanner (AI Vision)")
-st.write("Upload or capture a passport photo. The app uses GPT-4o-mini vision to read the MRZ and extract fields.")
+st.write("Upload or capture a passport photo. The app uses GPT-4o-mini vision to read the MRZ and show a sample email draft.")
 
-# Upload or Camera input
 uploaded = st.file_uploader("Upload passport photo", type=["jpg", "jpeg", "png"])
 cam = st.camera_input("Or take a picture")
 
@@ -34,10 +31,9 @@ if image_file:
                     {
                         "role": "system",
                         "content": (
-                            "You are a document parsing assistant. Extract the machine-readable zone (MRZ) "
-                            "from passports and parse it into structured fields. "
-                            "Return JSON with: surname, given_names, passport_number, nationality, "
-                            "date_of_birth (YYYY-MM-DD), sex, expiry_date (YYYY-MM-DD)."
+                            "You are a document parsing assistant. Extract the MRZ from passports "
+                            "and parse it into structured fields. Return JSON with: surname, given_names, "
+                            "passport_number, nationality, date_of_birth (YYYY-MM-DD), sex, expiry_date (YYYY-MM-DD)."
                         )
                     },
                     {
@@ -50,11 +46,31 @@ if image_file:
                 ],
                 max_tokens=500
             )
-
-            result_text = response.choices[0].message.content
-
+            parsed_json = response.choices[0].message.content
         except Exception as e:
-            result_text = f"Error: {e}"
+            parsed_json = f"Error: {e}"
 
-    st.subheader("Extracted Data")
-    st.write(result_text)
+    st.subheader("Extracted Data (Raw JSON)")
+    st.code(parsed_json, language="json")
+
+    # --- Show sample email draft ---
+    st.subheader("📧 Sample Email Draft")
+    sample_email = f"""
+To: example@domain.com
+Subject: Passport Information Submission
+
+Hello,
+
+Please find below the extracted passport information:
+
+{parsed_json}
+
+The scanned passport image is attached for reference.
+
+Regards,
+Automated Passport Scanner
+"""
+    st.text_area("Email Preview", sample_email, height=300)
+
+    # Show "attachment preview"
+    st.image(image, caption="This image would be attached to the email", use_container_width=True)
