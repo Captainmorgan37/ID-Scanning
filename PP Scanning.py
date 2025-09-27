@@ -21,6 +21,11 @@ try:
     from rapidocr_onnxruntime import RapidOCR  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     RapidOCR = None  # type: ignore[assignment]
+
+try:
+    import easyocr  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    easyocr = None
 import re
 import PyPDF2
 st.set_page_config(page_title="Passport MRZ Scanner + Manifest Match", page_icon="🛂", layout="wide")
@@ -146,13 +151,48 @@ def parse_mrz_lines(line1: str, line2: str):
 # OpenCV MRZ detection & OCR reader
 # ==================================
 
+class OCRWrapper:
+    """Small adapter that hides the difference between RapidOCR and EasyOCR."""
+
+    def __init__(self):
+        self.backend = None
+        self.engine = None
+
+        if RapidOCR is not None:
+            self.engine = RapidOCR(det_use_cuda=False, rec_use_cuda=False, cls_use_cuda=False)
+            self.backend = "rapidocr"
+        elif easyocr is not None:
+            # EasyOCR can run fully on CPU; restrict to Latin characters.
+            self.engine = easyocr.Reader(["en"], gpu=False)
+            self.backend = "easyocr"
+
+        if self.engine is None:
+            raise RuntimeError(
+                "No OCR backend available. Please install 'rapidocr-onnxruntime' (preferred) or 'easyocr'."
+            )
+
+    def __call__(self, image: np.ndarray):
+        if self.backend == "rapidocr":
+            return self.engine(image)
+
+        # EasyOCR returns a list of (bbox, text, confidence).
+        results = self.engine.readtext(image, detail=1, paragraph=False)
+        formatted = []
+        for item in results:
+            if len(item) < 2:
+                continue
+            if len(item) == 2:
+                bbox, text = item
+                conf = 0.0
+            else:
+                bbox, text, conf = item
+            formatted.append((bbox, text, conf))
+        return formatted, None
+
+
 @st.cache_resource(show_spinner=False)
 def get_ocr():
-    if RapidOCR is None:
-        raise RuntimeError(
-            "rapidocr-onnxruntime is not installed. Please run 'pip install rapidocr-onnxruntime'."
-        )
-    return RapidOCR(det_use_cuda=False, rec_use_cuda=False, cls_use_cuda=False)
+    return OCRWrapper()
 
 
 def find_mrz_crop(bgr: np.ndarray) -> np.ndarray:
