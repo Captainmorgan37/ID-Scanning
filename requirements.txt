@@ -4,4 +4,3 @@ numpy
 # Pin PaddleOCR to the pre-3.x series to avoid mandatory PaddleX initialization
 # that conflicts with Streamlit's rerun semantics.
 paddleocr==2.7.0.3
-PyPDF2
