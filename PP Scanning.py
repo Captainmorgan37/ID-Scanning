@@ -1,7 +1,7 @@
-# Passport MRZ Scanner — Plan B (PaddleOCR) + PDF Manifest Matching
-# -----------------------------------------------------------------
+# Passport MRZ Scanner — Local OCR + PDF Manifest Matching
+# --------------------------------------------------------
 # What this does
-# - No paid AI: OpenCV + PaddleOCR for OCR, deterministic MRZ parsing with check‑digit validation
+# - No paid AI: OpenCV + RapidOCR (ONNXRuntime) for OCR, deterministic MRZ parsing with check‑digit validation
 # - Accepts camera or multi-upload of passport photos
 # - Accepts a PDF manifest (e.g., eAPIS / crew & pax list) and extracts Name, Passport Number, Expiry
 # - Matches each scanned passport to the manifest by Passport # (primary) and Name (secondary), then verifies expiry
@@ -15,60 +15,14 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     cv2 = None
 
-# PaddleOCR ≥3.0.0 pulls in PaddleX which raises a RuntimeError when the module is
-# re-imported (which happens frequently under Streamlit's rerun model).  We patch
-# the PaddleX repo manager so subsequent initialisation attempts are harmless.
+from datetime import datetime
 
-def _patch_paddlex_repo_manager():  # pragma: no cover - optional dependency
-    try:
-        import paddlex  # type: ignore
-        from paddlex import repo_manager  # type: ignore
-    except Exception:
-        return None
-
-    original_initialize = repo_manager.initialize
-
-    def initialize_once(*args, **kwargs):
-        if getattr(repo_manager, "_INITIALIZED", False):
-            return
-        try:
-            result = original_initialize(*args, **kwargs)
-        except RuntimeError as err:
-            if "PDX has already been initialized" not in str(err):
-                raise
-            result = None
-        repo_manager._INITIALIZED = True  # type: ignore[attr-defined]
-        return result
-
-    repo_manager.initialize = initialize_once
-    return repo_manager
-
-import importlib
-import io
+try:
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    RapidOCR = None  # type: ignore[assignment]
 import re
 import PyPDF2
-from datetime import datetime
-from typing import Any
-
-
-def _load_paddleocr_class():
-    """Return PaddleOCR class, applying the PaddleX patch if needed."""
-
-    try:
-        from paddleocr import PaddleOCR as _PaddleOCR
-    except RuntimeError as exc:  # pragma: no cover - depends on installed paddleocr
-        if "PDX has already been initialized" not in str(exc):
-            raise
-
-        repo_manager = _patch_paddlex_repo_manager()
-        if repo_manager is not None:
-            repo_manager._INITIALIZED = False  # type: ignore[attr-defined]
-        module = importlib.import_module("paddleocr")
-        _PaddleOCR = module.PaddleOCR  # type: ignore[attr-defined]
-    else:
-        _patch_paddlex_repo_manager()
-    return _PaddleOCR
-
 st.set_page_config(page_title="Passport MRZ Scanner + Manifest Match", page_icon="🛂", layout="wide")
 
 # =============================
@@ -188,14 +142,17 @@ def parse_mrz_lines(line1: str, line2: str):
         'mrz_line2': line2,
     }
 
-# ======================================
-# OpenCV MRZ detection & PaddleOCR reader
-# ======================================
+# ==================================
+# OpenCV MRZ detection & OCR reader
+# ==================================
 
 @st.cache_resource(show_spinner=False)
 def get_ocr():
-    PaddleOCRClass: Any = _load_paddleocr_class()
-    return PaddleOCRClass(use_angle_cls=False, lang='en')
+    if RapidOCR is None:
+        raise RuntimeError(
+            "rapidocr-onnxruntime is not installed. Please run 'pip install rapidocr-onnxruntime'."
+        )
+    return RapidOCR(det_use_cuda=False, rec_use_cuda=False, cls_use_cuda=False)
 
 
 def find_mrz_crop(bgr: np.ndarray) -> np.ndarray:
@@ -270,16 +227,19 @@ def ocr_mrz_lines(pil_img: Image.Image):
         bin_img = (gray > thresh).astype(np.uint8) * 255
         mrz_preview = Image.fromarray(mrz_rgb)
 
-    result = ocr.ocr(bin_img, cls=False)
+    result, _ = ocr(bin_img)
     candidates = []
     if result:
-        for block in result:
-            for line in block:
-                text = line[1][0]
-                text = text.upper()
-                text = re.sub(r'[^A-Z0-9<]', '', text)
-                if len(text) >= 30:
-                    candidates.append(text)
+        for item in result:
+            if len(item) < 2:
+                continue
+            text = item[1]
+            if isinstance(text, (list, tuple)):
+                text = text[0]
+            text = str(text).upper()
+            text = re.sub(r'[^A-Z0-9<]', '', text)
+            if len(text) >= 30:
+                candidates.append(text)
     candidates = sorted(set(candidates), key=lambda s: len(s), reverse=True)
     if len(candidates) >= 2:
         l1, l2 = candidates[0], candidates[1]
@@ -366,7 +326,7 @@ def name_similarity(n1: str, n2: str) -> float:
 st.title("🛂 Passport Scan → PDF Manifest Match (No API)")
 
 st.info(
-    "First MRZ scan loads the PaddleOCR model (~150 MB). The initial download can take up to a minute, "
+    "First MRZ scan downloads the RapidOCR ONNX weights (~90 MB). The initial fetch can take up to a minute, "
     "so please keep the app tab open until it finishes."
 )
 
@@ -459,5 +419,5 @@ st.caption("Note: For best accuracy, fill the frame with the MRZ band, reduce gl
 # pillow
 # numpy
 # opencv-python-headless
-# paddleocr
+# rapidocr-onnxruntime
 # PyPDF2

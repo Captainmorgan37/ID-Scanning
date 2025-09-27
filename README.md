@@ -1,7 +1,7 @@
 # Passport MRZ Scanner – Local Setup Notes
 
 This Streamlit application reads passport Machine Readable Zone (MRZ) text using
-PaddleOCR and matches it against a PDF crew/passenger manifest.  Only the
+RapidOCR (ONNXRuntime) and matches it against a PDF crew/passenger manifest.  Only the
 packages listed in `requirements.txt` are required to run the app locally:
 
 ```bash
@@ -10,10 +10,10 @@ pip install -r requirements.txt
 
 The PDF manifest parsing is implemented with [`PyPDF2`](https://pypdf2.readthedocs.io/)
 which ships pure Python wheels.  You **do not** need `PyMuPDF`/`fitz` for this
-project.  Installing an old `pymupdf==1.20.2` release forces pip to build from
-source, which can take several minutes and often fails on constrained
-environments.  If you previously tried to install that package you can remove it
-with:
+project.  Earlier versions of this app depended on PaddleOCR, whose packaging
+pulled in `pymupdf==1.20.2` and required compiling from source.  Switching to
+RapidOCR removes that fragile dependency.  If you previously tried to install
+the old package you can remove it with:
 
 ```bash
 pip uninstall pymupdf
