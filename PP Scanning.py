@@ -31,7 +31,12 @@ def _patch_paddlex_repo_manager():  # pragma: no cover - optional dependency
     def initialize_once(*args, **kwargs):
         if getattr(repo_manager, "_INITIALIZED", False):
             return
-        result = original_initialize(*args, **kwargs)
+        try:
+            result = original_initialize(*args, **kwargs)
+        except RuntimeError as err:
+            if "PDX has already been initialized" not in str(err):
+                raise
+            result = None
         repo_manager._INITIALIZED = True  # type: ignore[attr-defined]
         return result
 
