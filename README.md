@@ -1,8 +1,10 @@
 # Passport MRZ Scanner – Local Setup Notes
 
 This Streamlit application reads passport Machine Readable Zone (MRZ) text using
-RapidOCR (ONNXRuntime) and matches it against a PDF crew/passenger manifest.  Only the
-packages listed in `requirements.txt` are required to run the app locally:
+RapidOCR (ONNXRuntime) and matches it against a PDF crew/passenger manifest.  If
+RapidOCR cannot be installed on your platform the app now falls back to
+[EasyOCR](https://github.com/JaidedAI/EasyOCR), so installing the packages
+listed in `requirements.txt` is sufficient to run the app locally:
 
 ```bash
 pip install -r requirements.txt
