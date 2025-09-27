@@ -4,3 +4,4 @@ numpy
 opencv-python-headless
 paddleocr
 PyPDF2
+CV2
