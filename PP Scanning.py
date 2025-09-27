@@ -253,8 +253,11 @@ def ocr_mrz_lines(pil_img: Image.Image):
 # PDF manifest parsing (PyPDF2)
 # ==============================
 
-PASSPORT_RE = re.compile(r"P\s*Number\s*([A-Z0-9]+)\s*\(Exp\.\s*([0-9]{4}-[0-9]{2}-[0-9]{2})\)")
-NAME_RE = re.compile(r"Name\s+([A-Z'\- ]+)")
+PASSPORT_RE = re.compile(
+    r"P\s*Number\s*([A-Z0-9]+)\s*\(Exp\.\s*([0-9]{4}-[0-9]{2}-[0-9]{2})\)",
+    re.IGNORECASE,
+)
+NAME_RE = re.compile(r"Name\s+([A-Z'\- ]+)", re.IGNORECASE)
 
 
 def normalize_name(n: str) -> str:
@@ -284,11 +287,11 @@ def parse_manifest_pdf(uploaded_pdf) -> list:
             current_role = 'PAX'
             current_name = None
             continue
-        m_name = NAME_RE.search(u)
+        m_name = NAME_RE.search(ln)
         if m_name:
             current_name = normalize_name(m_name.group(1))
             continue
-        m_pass = PASSPORT_RE.search(u)
+        m_pass = PASSPORT_RE.search(ln)
         if m_pass and current_name:
             pnum = m_pass.group(1).strip()
             exp = m_pass.group(2).strip()
