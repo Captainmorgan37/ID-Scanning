@@ -1,13 +1,11 @@
-# Passport MRZ Scanner — Plan B (PaddleOCR, no external APIs)
-# ------------------------------------------------------------
-# Features
-# - Works locally or on Streamlit Cloud with pip-only deps (no external OCR APIs)
-# - Camera or multi-file upload
-# - OpenCV preprocessing to find/crop MRZ strip (bottom of passport)
-# - PaddleOCR to read characters
-# - Deterministic MRZ parsing (TD3) + ISO check‑digit validation
-# - Smart digit‑swap auto‑correction for expiry/passport number when check fails
-# - Shows raw MRZ lines, parsed fields, and validity indicators
+# Passport MRZ Scanner — Plan B (PaddleOCR) + PDF Manifest Matching
+# -----------------------------------------------------------------
+# What this does
+# - No paid AI: OpenCV + PaddleOCR for OCR, deterministic MRZ parsing with check‑digit validation
+# - Accepts camera or multi-upload of passport photos
+# - Accepts a PDF manifest (e.g., eAPIS / crew & pax list) and extracts Name, Passport Number, Expiry
+# - Matches each scanned passport to the manifest by Passport # (primary) and Name (secondary), then verifies expiry
+# - Shows a results table: Matched / Mismatch / Not Found with reasons
 
 import streamlit as st
 from PIL import Image
@@ -16,12 +14,14 @@ import cv2
 from paddleocr import PaddleOCR
 import io
 import re
+import PyPDF2
+from datetime import datetime
 
-st.set_page_config(page_title="Passport MRZ Scanner (Plan B)", page_icon="🛂", layout="centered")
+st.set_page_config(page_title="Passport MRZ Scanner + Manifest Match", page_icon="🛂", layout="wide")
 
-# -----------------------------
-# Helpers: MRZ parsing & checks
-# -----------------------------
+# =============================
+# MRZ helpers (parse & validate)
+# =============================
 
 def compute_check_digit(data: str) -> str:
     weights = [7, 3, 1]
@@ -32,61 +32,45 @@ def compute_check_digit(data: str) -> str:
         elif ch == '<':
             val = 0
         else:
-            # A=10, B=11, ... Z=35
-            val = ord(ch) - 55
+            val = ord(ch) - 55  # A=10 ... Z=35
         total += val * weights[i % 3]
     return str(total % 10)
 
 
 def validate(field: str, check_digit: str) -> bool:
-    if not field or not check_digit:
-        return False
-    return compute_check_digit(field) == check_digit
+    return bool(field and check_digit and compute_check_digit(field) == check_digit)
 
 
-def expand_date_yyMMdd(raw6: str) -> str:
-    # naive expansion: assume 19xx for DOB, 20xx for expiry
-    # (You can add smarter rules by comparing to today if desired.)
-    if len(raw6) != 6 or not raw6.isdigit():
-        return ""
-    yy, mm, dd = raw6[:2], raw6[2:4], raw6[4:6]
-    # Guard values
-    if not ("01" <= mm <= "12") or not ("01" <= dd <= "31"):
-        return ""
-    return f"20{yy}-{mm}-{dd}"
-
-
-def expand_dob_yyMMdd(raw6: str) -> str:
+def expand_date_yyMMdd(raw6: str, kind: str) -> str:
+    """Expand YYMMDD to YYYY-MM-DD.
+    kind: 'dob' -> assume 19YY; 'exp' -> assume 20YY (simple heuristic)."""
     if len(raw6) != 6 or not raw6.isdigit():
         return ""
     yy, mm, dd = raw6[:2], raw6[2:4], raw6[4:6]
     if not ("01" <= mm <= "12") or not ("01" <= dd <= "31"):
         return ""
-    return f"19{yy}-{mm}-{dd}"
+    century = "19" if kind == "dob" else "20"
+    return f"{century}{yy}-{mm}-{dd}"
 
 
 def smart_digit_swap_to_pass(field_raw: str, check_digit: str) -> str:
-    """Try small digit swaps likely to be misread (3↔8, 5↔6, 0↔8, 1↔7) to satisfy check digit.
-    Returns corrected raw field if found, else empty string.
-    """
+    """Attempt small digit substitutions to satisfy MRZ check digit (camera misreads like 3↔8, 5↔6, 0↔8, 1↔7)."""
     if not field_raw or not check_digit:
         return ""
     swaps = [("3","8"),("5","6"),("0","8"),("1","7"),("2","7"),("9","8")]
-    tried = set()
-    from collections import deque
-    dq = deque([field_raw])
-    while dq:
-        cur = dq.popleft()
-        if cur in tried:
-            continue
-        tried.add(cur)
-        if compute_check_digit(cur) == check_digit:
-            return cur
-        # enqueue one-swap variants
+    seen = {field_raw}
+    def try_variants(s):
+        if compute_check_digit(s) == check_digit:
+            return s
         for a,b in swaps:
-            dq.append(cur.replace(a,b,1))
-            dq.append(cur.replace(b,a,1))
-    return ""
+            for repl in [(a,b),(b,a)]:
+                t = s.replace(repl[0], repl[1], 1)
+                if t not in seen:
+                    seen.add(t)
+                    if compute_check_digit(t) == check_digit:
+                        return t
+        return ""
+    return try_variants(field_raw)
 
 
 def parse_mrz_lines(line1: str, line2: str):
@@ -130,15 +114,15 @@ def parse_mrz_lines(line1: str, line2: str):
             expiry_raw = corrected_exp
             expiry_valid = True
 
-    # Expand dates
-    dob = expand_dob_yyMMdd(dob_raw)
-    expiry = expand_date_yyMMdd(expiry_raw)
+    dob = expand_date_yyMMdd(dob_raw, 'dob')
+    expiry = expand_date_yyMMdd(expiry_raw, 'exp')
 
     return {
         'doc_type': doc_type,
         'issuing_country': issuing_country,
         'surname': surname,
         'given_names': given_names,
+        'full_name': f"{given_names} {surname}".strip(),
         'passport_number': passport_number,
         'passport_number_check': passport_check,
         'passport_valid': pn_valid,
@@ -152,108 +136,66 @@ def parse_mrz_lines(line1: str, line2: str):
         'mrz_line2': line2,
     }
 
+# ======================================
+# OpenCV MRZ detection & PaddleOCR reader
+# ======================================
 
-# -------------------------------------
-# OpenCV: detect & crop the MRZ region
-# -------------------------------------
+@st.cache_resource(show_spinner=False)
+def get_ocr():
+    return PaddleOCR(use_angle_cls=False, lang='en')
+
 
 def find_mrz_crop(bgr: np.ndarray) -> np.ndarray:
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3,3), 0)
-
-    # Emphasize horizontal text strokes
     gradX = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
     gradY = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=0, dy=1, ksize=-1)
-    grad = cv2.subtract(gradX, gradY)
-    grad = cv2.convertScaleAbs(grad)
-
-    # Normalize & threshold
+    grad = cv2.convertScaleAbs(cv2.subtract(gradX, gradY))
     grad = cv2.normalize(grad, None, 0, 255, cv2.NORM_MINMAX)
     _, thresh = cv2.threshold(grad, 0, 255, cv2.THRESH_OTSU)
-
-    # Morph close to connect MRZ band
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25,3))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    # Dilate slightly to join parts
     closed = cv2.dilate(closed, None, iterations=1)
-
-    # Find contours and pick a wide, bottom-ish rectangle
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
-        return bgr
-
+        y0 = int(h*0.65)
+        return bgr[y0:h, 0:w]
     candidates = []
     for c in cnts:
         x,y,wc,hc = cv2.boundingRect(c)
         aspect = wc / float(hc + 1e-6)
         area = wc * hc
-        # Heuristic: MRZ is wide & not too tall, near bottom third
         if aspect > 6 and area > (w*h)*0.02 and y > h*0.4:
             candidates.append((y, x, wc, hc))
-
     if not candidates:
-        # fallback: bottom third
         y0 = int(h*0.65)
         return bgr[y0:h, 0:w]
-
-    # Pick the lowest candidate (closest to bottom)
     candidates.sort(key=lambda t: t[0], reverse=True)
     y, x, wc, hc = candidates[0]
-    crop = bgr[y:y+hc, x:x+wc]
-
-    # Slightly pad horizontally
     pad = int(0.02*w)
-    x0 = max(0, x - pad)
-    x1 = min(w, x + wc + pad)
-    y0 = max(0, y - int(0.02*h))
-    y1 = min(h, y + hc + int(0.02*h))
+    x0 = max(0, x - pad); x1 = min(w, x + wc + pad)
+    y0 = max(0, y - int(0.02*h)); y1 = min(h, y + hc + int(0.02*h))
     return bgr[y0:y1, x0:x1]
 
 
-# ------------------
-# PaddleOCR wrapper
-# ------------------
-@st.cache_resource(show_spinner=False)
-def get_ocr():
-    # English OCR; angle_cls off because MRZ is horizontal; use GPU=False by default
-    return PaddleOCR(use_angle_cls=False, lang='en')
-
-
-def ocr_lines_from_image(pil_img: Image.Image):
+def ocr_mrz_lines(pil_img: Image.Image):
     ocr = get_ocr()
-    # Convert to BGR for Paddle's preprocessing
     bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-    # Find MRZ crop
     mrz_bgr = find_mrz_crop(bgr)
-
-    # Enhance crop: grayscale + binarize
     gray = cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    # Adaptive threshold for uneven lighting
-    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                    cv2.THRESH_BINARY, 31, 10)
-
-    # Run OCR
+    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 10)
     result = ocr.ocr(bin_img, cls=False)
-
-    # Collect candidate lines, keep only MRZ charset and no spaces
     candidates = []
     if result:
         for block in result:
             for line in block:
                 text = line[1][0]
-                # Normalize
                 text = text.upper()
                 text = re.sub(r'[^A-Z0-9<]', '', text)
-                text = text.replace(' ', '')
-                if len(text) >= 30:  # likely MRZ content
+                if len(text) >= 30:
                     candidates.append(text)
-
-    # Choose two best lines by length (descending) and proximity in y
-    # (Paddle returns lines roughly top->bottom already; we just take two longest)
     candidates = sorted(set(candidates), key=lambda s: len(s), reverse=True)
     if len(candidates) >= 2:
         l1, l2 = candidates[0], candidates[1]
@@ -261,71 +203,173 @@ def ocr_lines_from_image(pil_img: Image.Image):
         l1, l2 = candidates[0], ''
     else:
         l1, l2 = '', ''
+    mrz_preview = Image.fromarray(cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2RGB))
+    return l1, l2, mrz_preview
 
-    # Fallback: if nothing, create a bin-based guess of bottom third
-    return l1, l2, Image.fromarray(cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2RGB))
+# ==============================
+# PDF manifest parsing (PyPDF2)
+# ==============================
+
+PASSPORT_RE = re.compile(r"P\s*Number\s*([A-Z0-9]+)\s*\(Exp\.\s*([0-9]{4}-[0-9]{2}-[0-9]{2})\)")
+NAME_RE = re.compile(r"Name\s+([A-Z'\- ]+)")
 
 
-# --------------
-# Streamlit UI
-# --------------
+def normalize_name(n: str) -> str:
+    n = n.upper().strip()
+    n = re.sub(r"[^A-Z ]", " ", n)
+    n = re.sub(r"\s+", " ", n)
+    return n
 
-st.title("🛂 Passport MRZ Scanner (Plan B: PaddleOCR)")
-st.write("No external AI services. Uses OpenCV + PaddleOCR, then strict MRZ parsing with check‑digit validation.")
 
-mode = st.radio("Input method", ["📷 Take a photo", "📂 Upload photos"], horizontal=True)
+def parse_manifest_pdf(uploaded_pdf) -> list:
+    """Return list of dicts: {role: 'CREW'/'PAX', name, passport_number, expiry_date} """
+    reader = PyPDF2.PdfReader(uploaded_pdf)
+    text = "\n".join(page.extract_text() or '' for page in reader.pages)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-results = []
+    entries = []
+    current_role = None
+    current_name = None
 
-if mode == "📷 Take a photo":
-    camera_file = st.camera_input("Take a picture")
-    if camera_file:
-        img = Image.open(camera_file).convert('RGB')
-        st.image(img, caption="Original", use_container_width=True)
-        with st.spinner("Detecting MRZ and reading text..."):
-            l1, l2, mrz_preview = ocr_lines_from_image(img)
-        st.image(mrz_preview, caption="MRZ crop preview", use_container_width=True)
-        st.code(f"{l1}\n{l2}", language="text")
-        if l1 and l2:
-            parsed = parse_mrz_lines(l1, l2)
-            results.append((img, parsed))
-        else:
-            st.error("Could not confidently detect two MRZ lines. Try adjusting angle/lighting and retake.")
+    for ln in lines:
+        u = ln.upper()
+        if u.startswith('CREW'):
+            current_role = 'CREW'
+            current_name = None
+            continue
+        if u.startswith('PAX'):
+            current_role = 'PAX'
+            current_name = None
+            continue
+        m_name = NAME_RE.search(u)
+        if m_name:
+            current_name = normalize_name(m_name.group(1))
+            continue
+        m_pass = PASSPORT_RE.search(u)
+        if m_pass and current_name:
+            pnum = m_pass.group(1).strip()
+            exp = m_pass.group(2).strip()
+            entries.append({
+                'role': current_role or '',
+                'name': current_name,
+                'passport_number': pnum,
+                'expiry_date': exp
+            })
+            current_name = None
 
-else:
-    files = st.file_uploader("Upload one or more passport photos", type=["jpg","jpeg","png"], accept_multiple_files=True)
-    if files:
-        for f in files:
-            img = Image.open(f).convert('RGB')
-            st.image(img, caption=f.name, use_container_width=True)
-            with st.spinner(f"Reading MRZ from {f.name}..."):
-                l1, l2, mrz_preview = ocr_lines_from_image(img)
-            st.image(mrz_preview, caption="MRZ crop preview", use_container_width=True)
-            st.code(f"{l1}\n{l2}", language="text")
+    return entries
+
+# ==========================
+# Matching logic & UI output
+# ==========================
+
+def compare_dates(exp_manifest: str, exp_mrz: str) -> bool:
+    try:
+        d1 = datetime.strptime(exp_manifest, "%Y-%m-%d").date()
+        d2 = datetime.strptime(exp_mrz, "%Y-%m-%d").date()
+        return d1 == d2
+    except Exception:
+        return False
+
+
+def name_similarity(n1: str, n2: str) -> float:
+    s1 = set(normalize_name(n1).split())
+    s2 = set(normalize_name(n2).split())
+    if not s1 or not s2:
+        return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+
+st.title("🛂 Passport Scan → PDF Manifest Match (No API)")
+
+col_left, col_right = st.columns([1,1])
+
+with col_left:
+    st.subheader("1) Upload manifest PDF")
+    pdf_file = st.file_uploader("PDF (e.g., eAPIS)", type=["pdf"])
+    manifest = []
+    if pdf_file:
+        try:
+            manifest = parse_manifest_pdf(pdf_file)
+            st.success(f"Parsed {len(manifest)} entries from manifest.")
+            st.dataframe(manifest, use_container_width=True)
+        except Exception as e:
+            st.error(f"PDF parse error: {e}")
+
+with col_right:
+    st.subheader("2) Scan passports (camera or upload)")
+    mode = st.radio("Input", ["📷 Camera", "📂 Upload"], horizontal=True)
+    scans = []
+    if mode == "📷 Camera":
+        cam = st.camera_input("Take a passport photo")
+        if cam:
+            img = Image.open(cam).convert('RGB')
+            l1,l2,prev = ocr_mrz_lines(img)
+            st.image(prev, caption="MRZ crop", use_container_width=True)
+            st.code(f"{l1}\n{l2}")
             if l1 and l2:
-                parsed = parse_mrz_lines(l1, l2)
-                results.append((img, parsed))
-            else:
-                st.warning(f"{f.name}: Could not confidently detect two MRZ lines.")
+                scans.append(parse_mrz_lines(l1,l2))
+    else:
+        files = st.file_uploader("Upload passport photos", type=["jpg","jpeg","png"], accept_multiple_files=True)
+        if files:
+            for f in files:
+                img = Image.open(f).convert('RGB')
+                l1,l2,prev = ocr_mrz_lines(img)
+                st.image(prev, caption=f"MRZ crop: {f.name}", use_container_width=True)
+                st.code(f"{l1}\n{l2}")
+                if l1 and l2:
+                    scans.append(parse_mrz_lines(l1,l2))
 
-# Show parsed results
-if results:
-    st.markdown("---")
-    st.subheader("Parsed Fields & Validation")
-    for idx, (img, p) in enumerate(results, start=1):
-        st.markdown(f"**Result {idx}**")
-        cols = st.columns(2)
-        with cols[0]:
-            st.image(img, caption="Original", use_container_width=True)
-        with cols[1]:
-            st.markdown(f"**Surname:** {p.get('surname','')}")
-            st.markdown(f"**Given Names:** {p.get('given_names','')}")
-            st.markdown(f"**Passport Number:** {p.get('passport_number','')} → {'✅ valid' if p.get('passport_valid') else '❌ invalid'}")
-            st.markdown(f"**Nationality:** {p.get('nationality','')}")
-            st.markdown(f"**Date of Birth:** {p.get('date_of_birth','')} → {'✅ valid' if p.get('dob_valid') else '❌ invalid'}")
-            st.markdown(f"**Sex:** {p.get('sex','')}")
-            st.markdown(f"**Expiry Date:** {p.get('expiry_date','')} → {'✅ valid' if p.get('expiry_valid') else '❌ invalid'}")
-            st.text_area("MRZ Line 1", p.get('mrz_line1',''), height=60)
-            st.text_area("MRZ Line 2", p.get('mrz_line2',''), height=60)
+st.markdown("---")
 
-    st.info("If a field shows ❌, try re-capturing with less glare, flatter angle, and MRZ filling more of the frame. Auto-correction attempts small digit swaps when checks
+if manifest and scans:
+    st.subheader("3) Matching results")
+    rows = []
+    unmatched_scans = []
+
+    idx_by_pn = {m['passport_number'].upper(): m for m in manifest}
+
+    for s in scans:
+        s_pn = (s.get('passport_number') or '').upper()
+        s_name = s.get('full_name','')
+        s_exp = s.get('expiry_date','')
+        match = idx_by_pn.get(s_pn)
+        if match:
+            name_ok = name_similarity(match['name'], s_name) >= 0.5
+            exp_ok = compare_dates(match['expiry_date'], s_exp)
+            status = "✅ Match" if (name_ok and exp_ok) else ("⚠️ Check name" if not name_ok else "⚠️ Check expiry")
+            rows.append({
+                'status': status,
+                'manifest_name': match['name'],
+                'manifest_passport': match['passport_number'],
+                'manifest_expiry': match['expiry_date'],
+                'scan_name': s_name,
+                'scan_passport': s_pn,
+                'scan_expiry': s_exp
+            })
+        else:
+            unmatched_scans.append(s)
+
+    if rows:
+        st.dataframe(rows, use_container_width=True)
+
+    if unmatched_scans:
+        st.warning("Some scanned passports were not found in the manifest by passport number:")
+        for s in unmatched_scans:
+            st.write({
+                'scan_name': s.get('full_name',''),
+                'scan_passport': s.get('passport_number',''),
+                'scan_expiry': s.get('expiry_date','')
+            })
+
+st.caption("Note: For best accuracy, fill the frame with the MRZ band, reduce glare, and keep the passport flat.")
+
+# ==================
+# Requirements to add
+# ==================
+# streamlit
+# pillow
+# numpy
+# opencv-python-headless
+# paddleocr
+# PyPDF2
