@@ -10,7 +10,10 @@
 import streamlit as st
 from PIL import Image
 import numpy as np
-import cv2
+try:
+    import cv2
+except ImportError:  # pragma: no cover - optional dependency
+    cv2 = None
 from paddleocr import PaddleOCR
 import io
 import re
@@ -146,46 +149,76 @@ def get_ocr():
 
 
 def find_mrz_crop(bgr: np.ndarray) -> np.ndarray:
+    """Return an MRZ-focused crop.
+
+    If OpenCV is available we use contour based detection. Otherwise we fall back to
+    returning the bottom third of the image which still contains the MRZ in most
+    passport photos.
+    """
+
     h, w = bgr.shape[:2]
+
+    if cv2 is None:
+        y0 = int(h * 0.6)
+        return bgr[y0:h, 0:w]
+
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
     gradX = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
     gradY = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=0, dy=1, ksize=-1)
     grad = cv2.convertScaleAbs(cv2.subtract(gradX, gradY))
     grad = cv2.normalize(grad, None, 0, 255, cv2.NORM_MINMAX)
     _, thresh = cv2.threshold(grad, 0, 255, cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25,3))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
     closed = cv2.dilate(closed, None, iterations=1)
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
-        y0 = int(h*0.65)
+        y0 = int(h * 0.65)
         return bgr[y0:h, 0:w]
     candidates = []
     for c in cnts:
-        x,y,wc,hc = cv2.boundingRect(c)
+        x, y, wc, hc = cv2.boundingRect(c)
         aspect = wc / float(hc + 1e-6)
         area = wc * hc
-        if aspect > 6 and area > (w*h)*0.02 and y > h*0.4:
+        if aspect > 6 and area > (w * h) * 0.02 and y > h * 0.4:
             candidates.append((y, x, wc, hc))
     if not candidates:
-        y0 = int(h*0.65)
+        y0 = int(h * 0.65)
         return bgr[y0:h, 0:w]
     candidates.sort(key=lambda t: t[0], reverse=True)
     y, x, wc, hc = candidates[0]
-    pad = int(0.02*w)
-    x0 = max(0, x - pad); x1 = min(w, x + wc + pad)
-    y0 = max(0, y - int(0.02*h)); y1 = min(h, y + hc + int(0.02*h))
+    pad = int(0.02 * w)
+    x0 = max(0, x - pad)
+    x1 = min(w, x + wc + pad)
+    y0 = max(0, y - int(0.02 * h))
+    y1 = min(h, y + hc + int(0.02 * h))
     return bgr[y0:y1, x0:x1]
 
 
 def ocr_mrz_lines(pil_img: Image.Image):
     ocr = get_ocr()
-    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    mrz_bgr = find_mrz_crop(bgr)
-    gray = cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 10)
+    rgb = np.array(pil_img)
+
+    if cv2 is not None:
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        mrz_bgr = find_mrz_crop(bgr)
+        gray = cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        bin_img = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 10
+        )
+        mrz_preview = Image.fromarray(cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2RGB))
+    else:
+        # Fallback: simple bottom crop & threshold using numpy only
+        mrz_rgb = find_mrz_crop(rgb)
+        gray = (0.299 * mrz_rgb[:, :, 0] + 0.587 * mrz_rgb[:, :, 1] + 0.114 * mrz_rgb[:, :, 2]).astype(
+            np.uint8
+        )
+        thresh = gray.mean()
+        bin_img = (gray > thresh).astype(np.uint8) * 255
+        mrz_preview = Image.fromarray(mrz_rgb)
+
     result = ocr.ocr(bin_img, cls=False)
     candidates = []
     if result:
@@ -203,7 +236,6 @@ def ocr_mrz_lines(pil_img: Image.Image):
         l1, l2 = candidates[0], ''
     else:
         l1, l2 = '', ''
-    mrz_preview = Image.fromarray(cv2.cvtColor(mrz_bgr, cv2.COLOR_BGR2RGB))
     return l1, l2, mrz_preview
 
 # ==============================
