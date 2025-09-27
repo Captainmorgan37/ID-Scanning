@@ -43,25 +43,31 @@ def _patch_paddlex_repo_manager():  # pragma: no cover - optional dependency
     repo_manager.initialize = initialize_once
     return repo_manager
 
-
-try:
-    from paddleocr import PaddleOCR
-except RuntimeError as exc:  # pragma: no cover - depends on installed paddleocr
-    if "PDX has already been initialized" not in str(exc):
-        raise
-    import importlib
-
-    repo_manager = _patch_paddlex_repo_manager()
-    if repo_manager is not None:
-        repo_manager._INITIALIZED = False  # type: ignore[attr-defined]
-    PaddleOCR = importlib.import_module("paddleocr").PaddleOCR  # type: ignore[attr-defined]
-else:
-    _patch_paddlex_repo_manager()
-
+import importlib
 import io
 import re
 import PyPDF2
 from datetime import datetime
+from typing import Any
+
+
+def _load_paddleocr_class():
+    """Return PaddleOCR class, applying the PaddleX patch if needed."""
+
+    try:
+        from paddleocr import PaddleOCR as _PaddleOCR
+    except RuntimeError as exc:  # pragma: no cover - depends on installed paddleocr
+        if "PDX has already been initialized" not in str(exc):
+            raise
+
+        repo_manager = _patch_paddlex_repo_manager()
+        if repo_manager is not None:
+            repo_manager._INITIALIZED = False  # type: ignore[attr-defined]
+        module = importlib.import_module("paddleocr")
+        _PaddleOCR = module.PaddleOCR  # type: ignore[attr-defined]
+    else:
+        _patch_paddlex_repo_manager()
+    return _PaddleOCR
 
 st.set_page_config(page_title="Passport MRZ Scanner + Manifest Match", page_icon="🛂", layout="wide")
 
@@ -188,7 +194,8 @@ def parse_mrz_lines(line1: str, line2: str):
 
 @st.cache_resource(show_spinner=False)
 def get_ocr():
-    return PaddleOCR(use_angle_cls=False, lang='en')
+    PaddleOCRClass: Any = _load_paddleocr_class()
+    return PaddleOCRClass(use_angle_cls=False, lang='en')
 
 
 def find_mrz_crop(bgr: np.ndarray) -> np.ndarray:
@@ -240,7 +247,8 @@ def find_mrz_crop(bgr: np.ndarray) -> np.ndarray:
 
 
 def ocr_mrz_lines(pil_img: Image.Image):
-    ocr = get_ocr()
+    with st.spinner("Loading OCR model (first run can take up to a minute)..."):
+        ocr = get_ocr()
     rgb = np.array(pil_img)
 
     if cv2 is not None:
@@ -356,6 +364,11 @@ def name_similarity(n1: str, n2: str) -> float:
 
 
 st.title("🛂 Passport Scan → PDF Manifest Match (No API)")
+
+st.info(
+    "First MRZ scan loads the PaddleOCR model (~150 MB). The initial download can take up to a minute, "
+    "so please keep the app tab open until it finishes."
+)
 
 col_left, col_right = st.columns([1,1])
 
