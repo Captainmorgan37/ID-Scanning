@@ -14,7 +14,45 @@ try:
     import cv2
 except ImportError:  # pragma: no cover - optional dependency
     cv2 = None
-from paddleocr import PaddleOCR
+
+# PaddleOCR ≥3.0.0 pulls in PaddleX which raises a RuntimeError when the module is
+# re-imported (which happens frequently under Streamlit's rerun model).  We patch
+# the PaddleX repo manager so subsequent initialisation attempts are harmless.
+
+def _patch_paddlex_repo_manager():  # pragma: no cover - optional dependency
+    try:
+        import paddlex  # type: ignore
+        from paddlex import repo_manager  # type: ignore
+    except Exception:
+        return None
+
+    original_initialize = repo_manager.initialize
+
+    def initialize_once(*args, **kwargs):
+        if getattr(repo_manager, "_INITIALIZED", False):
+            return
+        result = original_initialize(*args, **kwargs)
+        repo_manager._INITIALIZED = True  # type: ignore[attr-defined]
+        return result
+
+    repo_manager.initialize = initialize_once
+    return repo_manager
+
+
+try:
+    from paddleocr import PaddleOCR
+except RuntimeError as exc:  # pragma: no cover - depends on installed paddleocr
+    if "PDX has already been initialized" not in str(exc):
+        raise
+    import importlib
+
+    repo_manager = _patch_paddlex_repo_manager()
+    if repo_manager is not None:
+        repo_manager._INITIALIZED = False  # type: ignore[attr-defined]
+    PaddleOCR = importlib.import_module("paddleocr").PaddleOCR  # type: ignore[attr-defined]
+else:
+    _patch_paddlex_repo_manager()
+
 import io
 import re
 import PyPDF2
