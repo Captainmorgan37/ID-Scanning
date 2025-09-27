@@ -3,4 +3,3 @@ pillow
 numpy
 paddleocr
 PyPDF2
-cv2
